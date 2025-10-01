@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>ESP32 MacroPad — One-Click Web Flasher</title>
+<title>ESP32 MacroPad — One-Click Web Flasher (Fixed)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:24px;color:#222;background:#fafafa}
@@ -16,11 +16,8 @@
   .ok{color:#0a7}.warn{color:#c60}.err{color:#d33}
 </style>
 
-<h1>ESP32 MacroPad — One-Click Web Flasher</h1>
-<p class="muted">
-  Steps: 1) Click <b>Connect</b> → choose your ESP32 serial port (Chrome/Edge). 2) Click <b>Flash</b>.
-  If issues, try lower baud (115200), shorter cable, hold <b>BOOT</b> while flashing, or click <b>Erase first</b>.
-</p>
+<h1>ESP32 MacroPad — One-Click Web Flasher (Fixed)</h1>
+<p class="muted">Steps: 1) Click <b>Connect</b> → select your ESP32 serial port. 2) Click <b>Flash</b>. If issues, try lower baud (115200), shorter cable, hold <b>BOOT</b> while flashing, or check the “Erase first” checkbox.</p>
 
 <div class="card">
   <div class="row" style="margin-bottom:12px">
@@ -59,35 +56,46 @@
   <div id="log"></div>
 </div>
 
-<!-- esptool.js -->
-<script src="https://espressif.github.io/esptool-js/umd/esptool.umd.min.js"></script>
+<!-- Load esptool-js from unpkg -->
+<script src="https://unpkg.com/esptool-js/lib/index.js"></script>
 <script>
-/* ====== Your firmware URLs (RAW links) ====== */
+  if (!window.ESPLoader) {
+    // fallback try bundle
+    const s = document.createElement('script');
+    s.src = "https://unpkg.com/esptool-js/bundle.js";
+    document.head.appendChild(s);
+  }
+</script>
+
+<script>
+// Your firmware URLs (raw links)
 const URL_BOOT = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/bootloader.bin";
 const URL_PART = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/partitions.bin";
 const URL_APP  = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/firmware.bin";
-/* ============================================ */
 
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
-function logLn(s, cls){ const x=document.createElement('div'); x.textContent=s; if(cls)x.className=cls; logEl.appendChild(x); logEl.scrollTop=logEl.scrollHeight; }
-function hex(v){ return "0x"+v.toString(16); }
+function logLn(s, cls){ const x=document.createElement('div'); x.textContent=s; if(cls) x.className=cls; logEl.appendChild(x); logEl.scrollTop = logEl.scrollHeight; }
+function hex(v){ return "0x" + v.toString(16); }
 
 async function fetchAsU8(url){
-  const r = await fetch(url, {cache:"no-store"});
-  if(!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  const r = await fetch(url, {cache: "no-store"});
+  if (!r.ok) throw new Error(`HTTP ${r.status} loading ${url}`);
   const buf = await r.arrayBuffer();
   return new Uint8Array(buf);
 }
 
-let port=null, loader=null, connected=false;
+let port = null, loader = null, connected = false;
 
 async function connect(){
-  try{
-    if(!("serial" in navigator)) throw new Error("Web Serial not supported. Use Chrome/Edge desktop.");
-    logLn("Opening serial…");
+  if (!("serial" in navigator)) {
+    alert("Web Serial API not supported in this browser. Use Chrome / Edge.");
+    return;
+  }
+  logLn("Opening serial…");
+  try {
     port = await navigator.serial.requestPort({});
-    const baud = parseInt(document.getElementById('baud').value,10)||115200;
+    const baud = parseInt(document.getElementById('baud').value) || 115200;
     await port.open({ baudRate: baud });
     const transport = new esptool.Transport(port);
     loader = new esptool.ESPLoader(transport, baud, logLn);
@@ -95,13 +103,13 @@ async function connect(){
     const chip = await loader.chipName();
     logLn(`Connected: ${chip}`, "ok");
     connected = true;
-  }catch(e){
-    logLn("Connect error: "+e, "err");
+  } catch (e) {
+    logLn("Connect error: " + e, "err");
   }
 }
 
 async function testDownload(){
-  try{
+  try {
     logLn("Downloading bootloader…");
     const b = await fetchAsU8(URL_BOOT);
     logLn(`  bootloader.bin ${b.length} bytes`, "ok");
@@ -112,8 +120,8 @@ async function testDownload(){
     const a = await fetchAsU8(URL_APP);
     logLn(`  firmware.bin ${a.length} bytes`, "ok");
     logLn("All files ready.", "ok");
-  }catch(e){
-    logLn("Download error: "+e, "err");
+  } catch(e) {
+    logLn("Download error: " + e, "err");
   }
 }
 
@@ -121,69 +129,62 @@ document.getElementById('connect').addEventListener('click', connect);
 document.getElementById('test').addEventListener('click', testDownload);
 
 document.getElementById('flash').addEventListener('click', async ()=>{
-  statusEl.textContent="";
-  if(!connected){ alert("Click Connect first."); return; }
+  statusEl.textContent = "";
+  if (!connected) { alert("Click Connect first"); return; }
 
-  // download three parts
   let boot, part, app;
-  try{
-    logLn("Fetching images…");
-    [boot, part, app] = await Promise.all([fetchAsU8(URL_BOOT), fetchAsU8(URL_PART), fetchAsU8(URL_APP)]);
+  try {
+    [boot, part, app] = await Promise.all([
+      fetchAsU8(URL_BOOT), fetchAsU8(URL_PART), fetchAsU8(URL_APP)
+    ]);
     logLn(`bootloader.bin ${boot.length} bytes`, "ok");
     logLn(`partitions.bin ${part.length} bytes`, "ok");
     logLn(`firmware.bin ${app.length} bytes`, "ok");
-  }catch(e){
-    logLn("Download error: "+e, "err"); return;
+  } catch(e) {
+    logLn("Download error: " + e, "err");
+    return;
   }
 
   const mode = document.getElementById('mode').value || 'dio';
   const freq = document.getElementById('freq').value || '40m';
-  const baud = parseInt(document.getElementById('baud').value,10)||115200;
 
-  try{
-    // optional erase
-    if(document.getElementById('erase').checked){
-      logLn("Erasing flash (may take ~10–20s)…", "warn");
+  try {
+    if (document.getElementById('erase').checked) {
+      logLn("Erasing flash…", "warn");
       await loader.eraseFlash();
       logLn("Erase done.", "ok");
     }
 
-    // write three parts with fixed offsets
     const parts = [
-      {address: 0x1000,  data: boot, name:"bootloader"},
-      {address: 0x8000,  data: part, name:"partitions"},
-      {address: 0x10000, data: app,  name:"firmware"},
+      {address: 0x1000, data: boot, name:"bootloader"},
+      {address: 0x8000, data: part, name:"partitions"},
+      {address: 0x10000, data: app, name:"firmware"}
     ];
-    logLn(`Writing 3 parts… mode=${mode}, freq=${freq}`, "warn");
 
-    let total = parts.reduce((s,p)=>s+p.data.length,0), written = 0;
-    const onProg = (idx, writtenInPart, totalInPart)=>{
-      const sofar = written + writtenInPart;
+    logLn(`Writing parts… mode=${mode}, freq=${freq}`, "warn");
+    let total = parts.reduce((s,p)=>s + p.data.length, 0);
+    let written = 0;
+    const onProg = (idx, w, tot) => {
+      const sofar = written + w;
       statusEl.textContent = `Flashing… ${(sofar/total*100).toFixed(1)}%`;
     };
 
-    for (let i=0;i<parts.length;i++){
+    for (let i=0; i<parts.length; i++) {
       const p = parts[i];
       logLn(`Part ${i+1}/3: ${p.name} @ ${hex(p.address)}`);
       await loader.writeFlash([[p.address, p.data]], 'keep', mode, freq, false,
-        (frac, writtenInPart, totalInPart)=>onProg(i, writtenInPart, totalInPart)
+        (frac, w, tot) => onProg(i, w, tot)
       );
       written += p.data.length;
-      logLn(`  done ${p.data.length} bytes.`, "ok");
+      logLn(`  done ${p.data.length} bytes`, "ok");
     }
 
-    statusEl.textContent = "Verifying app MD5…";
-    // simple verify: read back first 16 bytes to ensure mapping ok (full verify很慢，可按需改成 read+md5)
-    const check = await loader.readFlash(0x10000, 16);
-    if(check && check.byteLength === 16) logLn("Basic read-back OK.", "ok");
-
     statusEl.textContent = "Resetting…";
-    try{ await loader.hardReset(); }catch(e){}
-    logLn("Finished. You can close this page.", "ok");
-  }catch(e){
-    statusEl.textContent="";
-    logLn("Flash error: "+e, "err");
-    logLn("Tip: try lower baud (115200), shorter cable, hold BOOT while flashing.", "muted");
+    try { await loader.hardReset(); } catch(e) {}
+    logLn("Finished.", "ok");
+  } catch(e) {
+    logLn("Flash error: " + e, "err");
+    logLn("Tip: try lower baud (115200), shorter cable, hold BOOT while starting.", "muted");
   }
 });
 </script>
