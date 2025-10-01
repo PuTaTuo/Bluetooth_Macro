@@ -1,0 +1,875 @@
+/*
+ * ESP32 MacroPad (BLE HID + Web Config)
+ * - 默认上电：NORMAL 模式（BLE HID）
+ * - 上电按住 CONFIG_PIN (GPIO33) ≥ 300ms：CONFIG 模式（Wi-Fi AP + Web UI）
+ *
+ * 功能：
+ *  - 16 个独立按键（内上拉，按键 → GND）
+ *  - SPIFFS:/macros.json 存配置
+ *  - Web 可视化编辑（Tap=第一组宏；开启 Hold 后可配第二组宏）
+ *  - Hold 开关 per-key：tap_hold[K].enabled + threshold_ms + hold_macro[]
+ *  - 只对 delay 步骤保存 ms；其它步骤仅保存 value
+ *  - 稳定的组合键发送（GUI/Win 键不会误触发 Ctrl/Shift/Alt）
+ *
+ * 需要的库：
+ *  - ESP32 core for Arduino
+ *  - ESP32 BLE Keyboard (t-vk/ESP32-BLE-Keyboard)
+ *  - ArduinoJson
+ */
+
+#include <Arduino.h>
+#include <SPIFFS.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <BleKeyboard.h>
+#include "esp_sleep.h" 
+
+// ======================= User Config =======================
+const char *AP_SSID = "ESP32-Macro";
+const char *AP_PASS = "12345678";            // 可留空，但建议设置
+#define CONFIG_PIN      33                   // 上电按住它进入配置模式（须接到 GND 的实体按键）
+#define CONFIG_HOLD_MS  300                  // 判定为“按住”的时长
+// 16 个省心 IO（内上拉、避免启动绑定位）
+const uint8_t KEY_PINS[] = {4,5,13,14,16,17,18,19,21,22,23,25,26,27,32,33};
+const uint8_t N_KEYS = sizeof(KEY_PINS);
+
+const uint16_t DEBOUNCE_MS    = 10;
+const uint16_t HOLD_THRESH_MS = 300;         // 默认长按阈值（可被每键覆盖）
+
+static uint32_t g_lastActivityMs = 0;  // —— Idle 计时 ——
+#define IDLE_SLEEP_TIMEOUT_MS  60000   // 1 分钟
+
+// ===== latency profile =====
+#define LOW_LATENCY 1   // 1=低延迟；0=稳妥
+
+// 建议：先试 LOW_LATENCY=1，如个别主机偶发不识别，再退回 0。
+static inline uint16_t t_mod_prep()   { return LOW_LATENCY ? 25  : 140; } // 修饰键后等待
+static inline uint16_t t_main_hold()  { return LOW_LATENCY ? 15  : 120; } // 主键按住时长
+static inline uint16_t t_release_gap(){ return LOW_LATENCY ? 0   : 30;  } // 释放前停顿
+
+// ===========================================================
+
+// --------- BLE Keyboard ---------
+BleKeyboard ble("ESP32 MacroPad", "WZ", 100);
+
+// --------- Web Server ----------
+WebServer server(80);
+
+// --------- States --------------
+struct KeyState {
+  bool stable;         // 去抖后稳定状态：true=按下
+  bool reading;        // 最新读值
+  uint32_t lastChange; // 上次原始值变化时间
+  uint32_t pressedAt;  // 最近一次按下时间
+} ks[32];
+
+bool g_configMode = false;
+bool suppressFirstReleaseConfigKey = true; // 抑制配置键开机后第一次“松开”触发
+
+// --------- Config JSON ----------
+StaticJsonDocument<8192> g_cfg;
+String currentLayer = "base";
+
+// ================= SPIFFS helpers =================
+bool ensureDefaultJson() {
+  if (SPIFFS.exists("/macros.json")) return true;
+  File f = SPIFFS.open("/macros.json", FILE_WRITE);
+  if (!f) return false;
+  const char *tmpl =
+    "{\n"
+    "  \"layers\":[\"base\"],\n"
+    "  \"keymap\":{\n"
+    "    \"K1\":{\"layer\":\"base\",\"macro\":[{\"type\":\"keys\",\"value\":\"CTRL+ALT+T\"}]},\n"
+    "    \"K2\":{\"layer\":\"base\",\"macro\":[{\"type\":\"text\",\"value\":\"Hello from ESP32!\"}]},\n"
+    "    \"K3\":{\"layer\":\"base\",\"macro\":[{\"type\":\"media\",\"value\":\"VOLUME_UP\"}]}\n"
+    "  },\n"
+    "  \"tap_hold\":{\n"
+    "    \"K4\":{\"enabled\":true,\"threshold_ms\":180,\"hold_macro\":[{\"type\":\"keys\",\"value\":\"CTRL+SHIFT+ESC\"}]}\n"
+    "  }\n"
+    "}\n";
+  f.print(tmpl);
+  f.close();
+  return true;
+}
+
+bool loadConfig() {
+  File f = SPIFFS.open("/macros.json", FILE_READ);
+  if (!f) return false;
+  DeserializationError err = deserializeJson(g_cfg, f);
+  f.close();
+  return !err;
+}
+
+bool saveConfig(const String &s) {
+  // 先校验
+  StaticJsonDocument<8192> test;
+  if (deserializeJson(test, s)) return false;
+  // 临时写入再原子替换
+  File tmp = SPIFFS.open("/macros.tmp", FILE_WRITE);
+  if (!tmp) return false;
+  tmp.print(s);
+  tmp.close();
+  if (SPIFFS.exists("/macros.bak")) SPIFFS.remove("/macros.bak");
+  if (SPIFFS.exists("/macros.json")) SPIFFS.rename("/macros.json", "/macros.bak");
+  SPIFFS.rename("/macros.tmp", "/macros.json");
+  return loadConfig();
+}
+
+// ================= Web UI =================
+const char PAGE_INDEX[] PROGMEM = R"HTML(
+<!doctype html><meta charset="utf-8">
+<title>ESP32 MacroPad Config</title>
+<style>
+  :root{--fg:#222;--muted:#666;--bg:#fafafa;--card:#fff;--bd:#ddd}
+  *{box-sizing:border-box} body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;
+  margin:16px;background:var(--bg);color:var(--fg)} h1{margin:0 0 12px}
+  .row{display:flex;gap:16px;flex-wrap:wrap}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .key{padding:14px;border:1px solid var(--bd);border-radius:10px;background:#fff;cursor:pointer;text-align:left}
+  .key small{display:block;color:var(--muted);margin-top:6px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--bd);font-size:12px;color:var(--muted)}
+  .panel{flex:1 1 560px;min-width:380px}
+  label{font-size:12px;color:var(--muted)} select,input[type=text],input[type=number]{width:100%;padding:8px;border:1px solid var(--bd);border-radius:8px}
+  .steps{margin-top:8px}
+  .step{display:grid;grid-template-columns:140px 1fr 90px;gap:8px;align-items:center;margin-bottom:8px}
+  .step .rm{width:90px}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  button{padding:8px 12px;border:1px solid var(--bd);background:#fff;border-radius:8px;cursor:pointer}
+  button.primary{background:#1a73e8;color:#fff;border-color:#1a73e8}
+  .muted{color:var(--muted)}
+  .kbd{font-family:ui-monospace,Consolas,monospace;background:#f2f2f2;border:1px solid #e5e5e5;padding:1px 6px;border-radius:6px}
+  .hr{border-top:1px dashed var(--bd);margin:12px 0}
+  .row-wrap{display:flex;gap:16px;flex-wrap:wrap}
+  .aside{flex:0 0 320px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{border:1px solid var(--bd);padding:6px;text-align:left}
+  th{background:#f6f6f6}
+  details{border:1px solid var(--bd);border-radius:8px;padding:10px;background:#fff}
+  details summary{cursor:pointer;font-weight:600;margin:-10px -10px 10px -10px;padding:10px}
+  code{background:#f4f4f4;border:1px solid #e5e5e5;border-radius:6px;padding:2px 6px}
+</style>
+
+<h1>ESP32 MacroPad — Visual Config</h1>
+<p class="muted">
+  Click a key on the left to edit. When done, click <span class="kbd">Save All</span> to write <code>macros.json</code>, then <span class="kbd">Reboot</span> to return to BLE mode.
+</p>
+
+<div class="row-wrap">
+  <!-- Keys -->
+  <div class="card" style="flex:0 0 360px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <strong>Keys (K1..K16)</strong>
+      <span id="layer-badge" class="pill">Layer: <b id="cur-layer">base</b></span>
+    </div>
+    <div id="grid" class="grid"></div>
+    <div class="toolbar" style="margin-top:12px">
+      <button onclick="loadJson()">Load from device</button>
+      <button onclick="downloadJson()">Export JSON</button>
+      <label style="display:inline-flex;align-items:center;gap:8px">
+        <input id="file" type="file" accept="application/json" style="display:none" onchange="importJson(this.files[0])">
+        <button onclick="document.getElementById('file').click()">Import JSON</button>
+      </label>
+    </div>
+  </div>
+
+  <!-- Editor -->
+  <div class="panel card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <strong id="title">Select a key to edit</strong>
+        <div class="muted" id="subtitle"></div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <label>Layer</label>
+        <select id="layer"></select>
+        <input id="new-layer" type="text" placeholder="New layer name (Enter to add)" style="width:200px">
+      </div>
+    </div>
+
+    <div class="hr"></div>
+
+    <div>
+      <label>Tap / Hold</label>
+      <div style="display:flex;align-items:center;gap:10px;margin:6px 0 10px">
+        <input id="th-enable" type="checkbox">
+        <span>Enable <b>Hold</b>. When disabled, only <b>Tap</b> macro runs; if Tap steps are empty, nothing happens.</span>
+      </div>
+
+      <div class="hr"></div>
+
+      <div>
+        <strong>Tap steps (first macro)</strong>
+        <div id="steps-tap" class="steps"></div>
+        <div class="toolbar">
+          <button onclick="addStepTap('keys')">+ keys</button>
+          <button onclick="addStepTap('text')">+ text</button>
+          <button onclick="addStepTap('media')">+ media</button>
+          <button onclick="addStepTap('delay')">+ delay</button>
+          <button onclick="addStepTap('layer')">+ layer</button>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div>
+        <strong>Hold steps (second macro)</strong>
+        <div style="display:flex;align-items:center;gap:12px;margin:6px 0">
+          <label>Hold threshold (ms)</label>
+          <input id="hold-th" type="number" value="300" min="50" step="10">
+        </div>
+        <div id="steps-hold" class="steps"></div>
+        <div class="toolbar">
+          <button onclick="addStepHold('keys')">+ keys</button>
+          <button onclick="addStepHold('text')">+ text</button>
+          <button onclick="addStepHold('media')">+ media</button>
+          <button onclick="addStepHold('delay')">+ delay</button>
+          <button onclick="addStepHold('layer')">+ layer</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="hr"></div>
+    <div class="toolbar">
+      <button class="primary" onclick="saveAll()">Save All</button>
+      <button onclick="reboot()">Reboot</button>
+      <span class="muted" id="status"></span>
+    </div>
+  </div>
+
+  <!-- Reference -->
+  <div class="aside card">
+
+    <details open>
+      <summary>Key Name Reference</summary>
+      <div style="font-size:13px;line-height:1.5">
+        <p><b>Modifiers</b>: <code>CTRL</code>, <code>ALT</code>, <code>SHIFT</code>, <code>GUI</code> (a.k.a. <code>WIN</code> / <code>CMD</code>)</p>
+        <p><b>Function</b>: <code>F1</code> ... <code>F12</code></p>
+        <p><b>Navigation</b>: <code>ESC</code>, <code>TAB</code>, <code>ENTER</code>, <code>SPACE</code>, <code>UP</code>, <code>DOWN</code>, <code>LEFT</code>, <code>RIGHT</code></p>
+        <p><b>Media</b>: <code>VOLUME_UP</code>, <code>VOLUME_DOWN</code>, <code>MUTE</code>, <code>PLAY_PAUSE</code>, <code>NEXT</code>, <code>PREV</code></p>
+        <p><b>Layer change</b>: type <code>layer</code>, value = your layer name (e.g. <code>fn</code>)</p>
+        <p><b>Combos (type=keys)</b>: join with <code>+</code>. Examples:
+          <br><code>CTRL+SHIFT+ESC</code>, <code>GUI+R</code>, <code>ALT+F4</code>, <code>CTRL+C</code>, <code>CTRL+V</code>
+        </p>
+        <p><b>Text (type=text)</b>: any string, e.g. <code>Hello World</code></p>
+        <p><b>Delay (type=delay)</b>: use the milliseconds field, e.g. 200</p>
+      </div>
+    </details>
+
+    <div class="hr"></div>
+
+    <details open>
+      <summary>GPIO Map (K → GPIO)</summary>
+      <table>
+        <thead><tr><th>Key</th><th>GPIO</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>K1</td><td>GPIO4</td><td>Pull-up, safe</td></tr>
+          <tr><td>K2</td><td>GPIO5</td><td>Pull-up, safe</td></tr>
+          <tr><td>K3</td><td>GPIO13</td><td>Pull-up, safe</td></tr>
+          <tr><td>K4</td><td>GPIO14</td><td>Pull-up, safe</td></tr>
+          <tr><td>K5</td><td>GPIO16</td><td>Pull-up, safe</td></tr>
+          <tr><td>K6</td><td>GPIO17</td><td>Pull-up, safe</td></tr>
+          <tr><td>K7</td><td>GPIO18</td><td>Pull-up, safe</td></tr>
+          <tr><td>K8</td><td>GPIO19</td><td>Pull-up, safe</td></tr>
+          <tr><td>K9</td><td>GPIO21</td><td>Pull-up, safe</td></tr>
+          <tr><td>K10</td><td>GPIO22</td><td>Pull-up, safe</td></tr>
+          <tr><td>K11</td><td>GPIO23</td><td>Pull-up, safe</td></tr>
+          <tr><td>K12</td><td>GPIO25</td><td>Pull-up, safe</td></tr>
+          <tr><td>K13</td><td>GPIO26</td><td>Pull-up, safe</td></tr>
+          <tr><td>K14</td><td>GPIO27</td><td>Pull-up, safe</td></tr>
+          <tr><td>K15</td><td>GPIO32</td><td>Pull-up, safe</td></tr>
+          <tr><td>K16</td><td>GPIO33</td><td>Pull-up, safe (also config key)</td></tr>
+        </tbody>
+      </table>
+    </details>
+    
+  </div>
+</div>
+
+<script>
+let data = {"layers":["base"],"keymap":{},"tap_hold":{}};
+let curKey = null;
+
+/* Element helper with proper event binding */
+function el(tag, attrs={}, kids=[]) {
+  const n = document.createElement(tag);
+  for (const k in attrs) {
+    if (k === "class") n.className = attrs[k];
+    else if (k === "text") n.textContent = attrs[k];
+    else if (k === "onclick") n.addEventListener("click", attrs[k]);
+    else if (k === "onchange") n.addEventListener("change", attrs[k]);
+    else if (k === "oninput") n.addEventListener("input", attrs[k]);
+    else n.setAttribute(k, attrs[k]);
+  }
+  kids.forEach(c => n.appendChild(c));
+  return n;
+}
+function msg(t){ const s=document.getElementById('status'); if(!s) return; s.textContent=t; setTimeout(()=>{s.textContent=""},3000); }
+function setHoldUIEnabled(enabled){
+  const th = document.getElementById('hold-th'); if (th) th.disabled = !enabled;
+  const sh = document.getElementById('steps-hold'); if (sh) sh.style.opacity = enabled? "1":"0.5";
+}
+
+/* Rendering */
+function summarize(k){
+  const e=data.keymap?.[k];
+  const layer=e?.layer||"base";
+  const m=e?.macro||[];
+  const s=m.map(x=>{
+    if(x.type==="keys") return "keys:"+(x.value||"");
+    if(x.type==="text") return "text:"+((x.value||"")+"").slice(0,16);
+    if(x.type==="media")return "media:"+(x.value||"");
+    if(x.type==="delay")return "delay:"+x.ms+"ms";
+    if(x.type==="layer")return "layer:"+(x.value||"");
+    return x.type;
+  }).join(" → ");
+  const th = (data.tap_hold && data.tap_hold[k]) || {};
+  const badge = th.enabled ? " [HOLD]" : "";
+  return `[${layer}] ${s}${badge}`;
+}
+function renderGrid(){
+  const g=document.getElementById('grid'); if(!g) return;
+  g.innerHTML="";
+  for (let i=1;i<=16;i++){
+    const k="K"+i;
+    const sum = summarize(k) || "(not set)";
+    const b=el("button",{class:"key",onclick:()=>openKey(k)});
+    b.innerHTML = `<b>${k}</b><small>${sum}</small>`;
+    g.appendChild(b);
+  }
+}
+function renderLayerSelect(){
+  const sel=document.getElementById('layer'); if(!sel) return;
+  sel.innerHTML="";
+  (data.layers||["base"]).forEach(L=> sel.appendChild(el("option",{value:L,text:L})));
+  const badge=document.getElementById('cur-layer');
+  if (badge) badge.textContent = (curKey && data.keymap[curKey] && data.keymap[curKey].layer) || "base";
+}
+function render(){ renderGrid(); renderLayerSelect(); if(curKey) openKey(curKey); }
+
+/* Step row (only delay shows & saves ms; others only value) */
+function stepRow(arrayRef, s, idx){
+  if (!s.type) s.type = "keys";
+  const normalize = () => {
+    if (s.type === "delay") { s.ms = typeof s.ms === "number" ? s.ms : 100; delete s.value; }
+    else { s.value = (s.value ?? ""); delete s.ms; }
+  };
+  normalize();
+
+  const row=el("div",{class:"step"});
+  const typeSel=el("select",{onchange:()=>{ s.type=typeSel.value; normalize(); renderInputs(); }});
+  ["keys","text","media","delay","layer"].forEach(t=> typeSel.appendChild(el("option",{value:t,text:t})));
+  typeSel.value=s.type;
+
+  const valueWrap=el("div");
+  const rm=el("button",{class:"rm",text:"Remove",onclick:()=>{ arrayRef.splice(idx,1); openKey(curKey); }});
+
+  const valInput=el("input",{type:"text",placeholder:"Value, e.g. CTRL+ALT+T / Hello / VOLUME_UP / fn",oninput:()=>{ s.value = valInput.value; }});
+  const msInput =el("input",{type:"number",min:"0",step:"10",placeholder:"ms",onchange:()=>{ s.ms = parseInt(msInput.value||"0"); }});
+  const mediaSel=el("select",{onchange:()=>{ s.value = mediaSel.value; }});
+  ["VOLUME_UP","VOLUME_DOWN","MUTE","PLAY_PAUSE","NEXT","PREV"].forEach(m=> mediaSel.appendChild(el("option",{value:m,text:m})));
+
+  function renderInputs(){
+    valueWrap.innerHTML="";
+    if (s.type === "delay") {
+      msInput.value = s.ms ?? 100;
+      valueWrap.appendChild(msInput);
+    } else if (s.type === "media") {
+      mediaSel.value = s.value || "VOLUME_UP";
+      valueWrap.appendChild(mediaSel);
+    } else {
+      valInput.value = s.value || "";
+      valueWrap.appendChild(valInput);
+    }
+  }
+  renderInputs();
+
+  row.appendChild(typeSel);
+  row.appendChild(valueWrap);
+  row.appendChild(rm);
+  return row;
+}
+
+/* Open a key */
+function openKey(k){
+  curKey=k;
+  document.getElementById('title').textContent = `Editing ${k}`;
+  document.getElementById('subtitle').textContent = summarize(k) || "(not set)";
+
+  // TAP: first macro -> keymap[k].macro
+  const entry = data.keymap[k] || (data.keymap[k]={layer:"base",macro:[]});
+  renderLayerSelect();
+  document.getElementById('layer').value = entry.layer||"base";
+  const badge=document.getElementById('cur-layer'); if (badge) badge.textContent = entry.layer||"base";
+
+  const stepsTapDiv=document.getElementById('steps-tap'); stepsTapDiv.innerHTML="";
+  entry.macro.forEach((s,idx)=> stepsTapDiv.appendChild(stepRow(entry.macro, s, idx)));
+
+  // HOLD: second macro -> tap_hold[k].hold_macro
+  if (!data.tap_hold[k]) data.tap_hold[k]={};
+  const th = data.tap_hold[k];
+  const enabled = !!th.enabled;
+  document.getElementById('th-enable').checked = enabled;
+  setHoldUIEnabled(enabled);
+  document.getElementById('hold-th').value = th.threshold_ms || 300;
+
+  th.hold_macro = Array.isArray(th.hold_macro) ? th.hold_macro : [];
+  const stepsHoldDiv=document.getElementById('steps-hold'); stepsHoldDiv.innerHTML="";
+  th.hold_macro.forEach((s,idx)=> stepsHoldDiv.appendChild(stepRow(th.hold_macro, s, idx)));
+}
+
+/* Add steps */
+function addStepTap(t){
+  if(!curKey){ alert("Select a key first"); return; }
+  const e = data.keymap[curKey] || (data.keymap[curKey]={layer:"base",macro:[]});
+  e.macro.push(t==="delay" ? {type:"delay",ms:100} : {type:t,value:""});
+  openKey(curKey);
+}
+function addStepHold(t){
+  if(!curKey){ alert("Select a key first"); return; }
+  if(!data.tap_hold[curKey]) data.tap_hold[curKey]={};
+  const arr = data.tap_hold[curKey].hold_macro || (data.tap_hold[curKey].hold_macro = []);
+  arr.push(t==="delay" ? {type:"delay",ms:100} : {type:t,value:""});
+  openKey(curKey);
+}
+
+/* Events */
+document.addEventListener('DOMContentLoaded', ()=>{
+  const layerSel = document.getElementById('layer');
+  if (layerSel) layerSel.addEventListener('change', e=>{
+    if(!curKey) return;
+    data.keymap[curKey] = data.keymap[curKey] || {macro:[]};
+    data.keymap[curKey].layer = e.target.value;
+    const badge=document.getElementById('cur-layer'); if (badge) badge.textContent=e.target.value;
+    renderGrid();
+  });
+
+  const newLayer = document.getElementById('new-layer');
+  if (newLayer) newLayer.addEventListener('keydown', e=>{
+    if(e.key!=="Enter") return;
+    const name=e.target.value.trim(); if(!name) return;
+    if(!data.layers.includes(name)) data.layers.push(name);
+    e.target.value="";
+    renderLayerSelect();
+    document.getElementById('layer').value=name;
+    if(curKey){ data.keymap[curKey].layer=name; const b=document.getElementById('cur-layer'); if(b) b.textContent=name; renderGrid(); }
+  });
+
+  const thEnable = document.getElementById('th-enable');
+  if (thEnable) thEnable.addEventListener('change', e=>{
+    const enabled = e.target.checked;
+    setHoldUIEnabled(enabled);
+    if (!curKey) return;
+    if (!data.tap_hold[curKey]) data.tap_hold[curKey] = {};
+    data.tap_hold[curKey].enabled = enabled;
+  });
+
+  loadJson();
+});
+
+/* I/O */
+async function loadJson(){
+  try{
+    const r=await fetch('/macros.json'); data=await r.json();
+    if (!data.layers) data.layers=["base"];
+    if (!data.keymap) data.keymap={};
+    if (!data.tap_hold) data.tap_hold={};
+    render(); msg("Loaded.");
+  }catch(e){ alert("Load failed: "+e); }
+}
+async function saveAll(){
+  // persist current key's hold enable & threshold (steps are live-updated in data)
+  if (curKey){
+    const en=document.getElementById('th-enable').checked;
+    const th=parseInt(document.getElementById('hold-th').value||"300");
+    if(!data.tap_hold[curKey]) data.tap_hold[curKey]={};
+    data.tap_hold[curKey].enabled = en;
+    data.tap_hold[curKey].threshold_ms = th;
+  }
+  try{
+    const r=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const t=await r.text();
+    if(r.ok){ msg("Saved."); renderGrid(); }
+    else{ alert("Save failed: "+t); }
+  }catch(e){ alert("Save failed: "+e); }
+}
+async function reboot(){ await fetch('/reboot'); alert('Rebooting…'); }
+function downloadJson(){
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='macros.json'; a.click();
+}
+async function importJson(file){
+  const text=await file.text();
+  try{
+    const obj=JSON.parse(text);
+    if(!obj.layers||!obj.keymap) throw new Error("Missing layers/keymap");
+    data=obj; render(); msg("Imported (not saved).");
+  }catch(e){ alert("Invalid JSON: "+e.message); }
+}
+
+/* Expose for buttons */
+window.addStepTap = addStepTap;
+window.addStepHold = addStepHold;
+window.saveAll = saveAll;
+window.reboot = reboot;
+window.loadJson = loadJson;
+window.downloadJson = downloadJson;
+window.importJson = importJson;
+</script>
+
+)HTML";
+
+void setupAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS[0] ? AP_PASS : nullptr);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("AP SSID: %s  IP: %s\n", AP_SSID, ip.toString().c_str());
+
+  server.on("/", HTTP_GET, [](){
+    server.send_P(200, "text/html; charset=utf-8", PAGE_INDEX);
+  });
+  server.on("/macros.json", HTTP_GET, [](){
+    File f = SPIFFS.open("/macros.json", FILE_READ);
+    if (!f) { server.send(404, "text/plain", "macros.json not found"); return; }
+    server.streamFile(f, "application/json"); f.close();
+  });
+  server.on("/save", HTTP_POST, [](){
+    String body = server.arg("plain");
+    if (saveConfig(body)) server.send(200, "text/plain", "OK");
+    else server.send(400, "text/plain", "Invalid JSON");
+  });
+  server.on("/reboot", HTTP_GET, [](){
+    server.send(200, "text/plain", "rebooting");
+    delay(200);
+    ESP.restart();
+  });
+  server.begin();
+}
+
+// =============== Boot-hold detect ===============
+bool isHeldOnBoot(uint8_t pin, uint16_t need_ms){
+  pinMode(pin, INPUT_PULLUP);     // 按下=LOW
+  uint32_t t0 = millis();
+  uint16_t samples = 0, lows = 0;
+
+  while ((millis() - t0) < need_ms) {
+    if (digitalRead(pin) == LOW) lows++;
+    samples++;
+    delay(1);
+  }
+  // 低电平比例 >= 80% 视为按住（按需调 70~90）
+  return (samples > 0) && (lows * 100 / samples >= 80);
+}
+
+// =============== Key helpers ====================
+String keyName(uint8_t idx){ return "K" + String(idx+1); }
+
+// —— 稳定的组合键发送（用布尔标志，不做位运算；确保修饰键与主键有足够重叠）——
+void sendCombo(const String &combo){
+  if (!ble.isConnected()) return;
+
+  bool useCtrl=false, useAlt=false, useShift=false, useGui=false;
+  uint8_t mainLetter = 0;   // a~z（BleKeyboard 会映射）
+  uint8_t mainSpecial = 0;  // ESC/TAB/ENTER/F1..等
+
+  auto setMod = [&](String t){
+    t.toUpperCase();
+    if (t=="CTRL" || t=="CONTROL") useCtrl = true;
+    else if (t=="ALT")             useAlt  = true;
+    else if (t=="SHIFT")           useShift= true;
+    else if (t=="GUI"||t=="WIN"||t=="CMD") useGui = true;
+  };
+  auto setSpecial = [&](const String &u){
+    String t=u; t.toUpperCase();
+    if (t=="ESC") mainSpecial = KEY_ESC;
+    else if (t=="TAB") mainSpecial = KEY_TAB;
+    else if (t=="ENTER"||t=="RETURN") mainSpecial = KEY_RETURN;
+    else if (t=="SPACE") mainSpecial = ' ';
+    else if (t=="UP") mainSpecial = KEY_UP_ARROW;
+    else if (t=="DOWN") mainSpecial = KEY_DOWN_ARROW;
+    else if (t=="LEFT") mainSpecial = KEY_LEFT_ARROW;
+    else if (t=="RIGHT") mainSpecial = KEY_RIGHT_ARROW;
+    else if (t=="F1") mainSpecial = KEY_F1;  else if (t=="F2") mainSpecial = KEY_F2;
+    else if (t=="F3") mainSpecial = KEY_F3;  else if (t=="F4") mainSpecial = KEY_F4;
+    else if (t=="F5") mainSpecial = KEY_F5;  else if (t=="F6") mainSpecial = KEY_F6;
+    else if (t=="F7") mainSpecial = KEY_F7;  else if (t=="F8") mainSpecial = KEY_F8;
+    else if (t=="F9") mainSpecial = KEY_F9;  else if (t=="F10") mainSpecial = KEY_F10;
+    else if (t=="F11") mainSpecial = KEY_F11;else if (t=="F12") mainSpecial = KEY_F12;
+  };
+
+  // 解析 "GUI+R" / "CTRL+ALT+DEL" 等
+  int start = 0;
+  while (true) {
+    int p = combo.indexOf('+', start);
+    String tok = (p<0) ? combo.substring(start) : combo.substring(start, p);
+    tok.trim();
+    if (tok.length()) {
+      if (tok.length()==1) {                 // 字母/字符主键
+        char c = tok[0];
+        if (c>='A' && c<='Z') c = c - 'A' + 'a';
+        mainLetter = (c>='a' && c<='z') ? (uint8_t)c : 0;
+        mainSpecial = 0;
+      } else {                               // 修饰或特殊键
+        setMod(tok);
+        setSpecial(tok);
+        if (mainSpecial) mainLetter = 0;
+      }
+    }
+    if (p<0) break;
+    start = p+1;
+  }
+
+  // 按下修饰键
+  if (useCtrl)  ble.press(KEY_LEFT_CTRL);
+  if (useAlt)   ble.press(KEY_LEFT_ALT);
+  if (useShift) ble.press(KEY_LEFT_SHIFT);
+  if (useGui)   ble.press(KEY_LEFT_GUI);
+
+  // 给系统反应时间（Win 键尤其需要）
+  delay(t_mod_prep());
+
+  // 主键按下维持一段时间，确保有重叠
+  if (mainLetter) { ble.press(mainLetter); delay(t_main_hold()); ble.release(mainLetter); }
+  else if (mainSpecial) { ble.press(mainSpecial); delay(t_main_hold()); ble.release(mainSpecial); }
+  else { delay(t_main_hold()); } // 只有修饰键：例如单发 WIN
+
+  delay(t_release_gap());
+  ble.releaseAll();
+  delay(10);
+}
+
+void sendMedia(const String &name){
+  if (!ble.isConnected()) return;
+  String u=name; u.toUpperCase();
+  if (u=="VOLUME_UP")        ble.write(KEY_MEDIA_VOLUME_UP);
+  else if (u=="VOLUME_DOWN") ble.write(KEY_MEDIA_VOLUME_DOWN);
+  else if (u=="MUTE")        ble.write(KEY_MEDIA_MUTE);
+  else if (u=="PLAY_PAUSE")  ble.write(KEY_MEDIA_PLAY_PAUSE);
+  else if (u=="NEXT")        ble.write(KEY_MEDIA_NEXT_TRACK);
+  else if (u=="PREV")        ble.write(KEY_MEDIA_PREVIOUS_TRACK);
+}
+
+void sendText(const String &txt){
+  if (!ble.isConnected()) return;
+  ble.print(txt);
+}
+
+void runMacro(JsonArray steps){
+  for (JsonObject s : steps){
+    String type = s["type"] | "";
+    if (type=="keys"){
+      String v = s["value"] | "";
+      if (v.length()) sendCombo(v);
+    } else if (type=="text"){
+      String v = s["value"] | "";
+      sendText(v);
+    } else if (type=="media"){
+      String v = s["value"] | "";
+      sendMedia(v);
+    } else if (type=="delay"){
+      uint32_t ms = s["ms"] | 0;
+      delay(ms);
+    } else if (type=="layer"){
+      currentLayer = (const char*)(s["value"] | "base");
+    }
+  }
+}
+
+// Tap=第一组宏（keymap[].macro）
+void fireTap(uint8_t idx){
+  String k = keyName(idx);
+  JsonObject keymap = g_cfg["keymap"].as<JsonObject>();
+  if (!keymap.containsKey(k)) return;               // 未配置 -> 不触发
+  JsonObject e = keymap[k];
+  String layer = e["layer"] | "base";
+  if (layer != currentLayer) return;
+  JsonArray macro = e["macro"].as<JsonArray>();
+  if (macro) runMacro(macro);                       // 空则不触发
+}
+
+// Hold=第二组宏（tap_hold[].hold_macro），兼容旧格式
+void fireHold(uint8_t idx){
+  String k = keyName(idx);
+  JsonObject th = g_cfg["tap_hold"][k];
+  if (th.isNull()) return;
+
+  if (th.containsKey("hold_macro")) {
+    JsonArray macro = th["hold_macro"].as<JsonArray>();
+    if (macro) runMacro(macro);
+    return;
+  }
+
+  // 旧格式兜底：对象 hold 或 hold.macro
+  JsonObject hold = th["hold"];
+  if (!hold.isNull()){
+    JsonArray macro = hold["macro"].as<JsonArray>();
+    if (macro) { runMacro(macro); return; }
+    StaticJsonDocument<256> tmp;
+    JsonArray arr = tmp.createNestedArray();
+    arr.add(hold);
+    runMacro(arr);
+  }
+}
+
+// 判断是否所有按键都处于“未按下”（HIGH）
+bool allKeysReleased() {
+  for (uint8_t i = 0; i < N_KEYS; i++) {
+    if (digitalRead(KEY_PINS[i]) == LOW) return false;
+  }
+  return true;
+}
+
+// 配置所有键为 Light Sleep 的 GPIO 唤醒源（按下=LOW 唤醒）
+void armGpioWakeupForKeys() {
+  // 先禁用可能残留的设置
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+  // 启用 GPIO 作为 light sleep 唤醒源
+  esp_sleep_enable_gpio_wakeup();
+
+  // 为每个键启用“低电平唤醒”
+  for (uint8_t i = 0; i < N_KEYS; i++) {
+    // 注意：按键是 INPUT_PULLUP，按下=LOW
+    gpio_wakeup_enable((gpio_num_t)KEY_PINS[i], GPIO_INTR_LOW_LEVEL);
+  }
+}
+
+// 进入 Light Sleep：按任意键（变为 LOW）即可唤醒
+void enterLightSleepAndWaitKey() {
+  Serial.println("[PM] Light sleep… press any key to wake");
+  
+  // ★ 在睡前发一个 HID 空报告，避免残留修饰键状态
+  if (ble.isConnected()) {
+    ble.releaseAll();       // 释放所有按下的键
+    delay(5);               // 给主机一点时间接收空报告
+  }
+  armGpioWakeupForKeys();
+
+  // 可选：降低唤醒延时；保留默认也行
+  // esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+  // 真正进入 light sleep（直到有键为 LOW）
+  esp_light_sleep_start();
+
+  // 醒来后这里继续执行
+  Serial.println("[PM] Woke by key");
+
+  // 重新记录活动时间，避免立刻再次入睡
+  g_lastActivityMs = millis();
+}
+
+// ================== setup / loop ==================
+void setup() {
+  Serial.begin(115200);
+  delay(20);
+
+  // —— 1) 最先判定是否进配置模式（任何耗时初始化之前）——
+  pinMode(CONFIG_PIN, INPUT_PULLUP);      // 按下=LOW
+  bool lowNow = (digitalRead(CONFIG_PIN) == LOW);
+  if (lowNow) {
+    g_configMode = true;                  // 即刻兜底：此刻就是 LOW → 直接进配置
+  } else {
+    // 占比采样：need_ms 窗口内 LOW 比例 ≥80% 视为“按住”
+    auto isHeldOnBoot = [](uint8_t pin, uint16_t need_ms)->bool {
+      pinMode(pin, INPUT_PULLUP);
+      uint32_t t0 = millis();
+      uint16_t samples = 0, lows = 0;
+      while ((millis() - t0) < need_ms) {
+        if (digitalRead(pin) == LOW) lows++;
+        samples++;
+        delay(1);
+      }
+      return (samples > 0) && (lows * 100 / samples >= 80);
+    };
+    g_configMode = isHeldOnBoot(CONFIG_PIN, CONFIG_HOLD_MS);
+  }
+
+  Serial.printf("CONFIG_PIN now=%s, mode=%s\n",
+                lowNow ? "LOW" : "HIGH",
+                g_configMode ? "CONFIG" : "NORMAL");
+
+  // —— 2) 文件系统与配置 —— 
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+    while (1) delay(1000);
+  }
+  ensureDefaultJson();
+  if (!loadConfig()) {
+    Serial.println("Config load failed, using empty");
+  }
+
+  // —— 3) 初始化全部按键（含 CONFIG_PIN 在内）——
+  for (uint8_t i = 0; i < N_KEYS; i++) {
+    pinMode(KEY_PINS[i], INPUT_PULLUP);   // 内上拉：按下=LOW
+    ks[i] = {false, false, millis(), 0};
+  }
+
+  // —— 4) 根据判定结果进入对应模式 —— 
+  if (g_configMode) {
+    Serial.println("Boot into CONFIG mode (AP + Web UI).");
+    setupAP();                            // 开热点 + Web UI
+  } else {
+    Serial.println("Boot into NORMAL mode (BLE HID).");
+    WiFi.mode(WIFI_OFF);                  // 省资源
+    ble.begin();                          // 启动 BLE 键盘
+  }
+  
+  // 记录上次活动时间（上电算一次活动，避免刚开机就睡）
+  g_lastActivityMs = millis();
+}
+
+
+void loop() {
+  // 配置模式处理 HTTP
+  if (WiFi.getMode() == WIFI_AP) {
+    server.handleClient();
+  }
+
+  uint32_t now = millis();
+  for (uint8_t i=0;i<N_KEYS;i++) {
+    bool raw = (digitalRead(KEY_PINS[i]) == LOW); // LOW=按下
+    if (raw != ks[i].reading) {
+      ks[i].reading   = raw;
+      ks[i].lastChange= now;   // 去抖起点
+    }
+    if ((now - ks[i].lastChange) >= DEBOUNCE_MS) {
+      if (ks[i].stable != ks[i].reading) {
+        ks[i].stable = ks[i].reading;
+        g_lastActivityMs = now;     // 任何一次状态变化都算“有活动”
+        if (ks[i].stable) {         // 刚按下
+          ks[i].pressedAt = now;
+        } else {                    // 刚松开
+          // 启动抑制：防止配置键松手被当作一次按键事件
+          if (KEY_PINS[i] == CONFIG_PIN && suppressFirstReleaseConfigKey) {
+            suppressFirstReleaseConfigKey = false;
+            continue;
+          }
+          uint32_t dur = now - ks[i].pressedAt;
+
+          // Tap / Hold 判定（仅当启用 Hold 时才判断时长）
+          String k = keyName(i);
+          JsonObject thObj = g_cfg["tap_hold"][k];
+          bool thEnabled = thObj["enabled"] | false; // 默认不启用
+
+          if (!thEnabled) {
+            fireTap(i); // 未启用：只执行 Tap（Tap 为空则无动作）
+          } else {
+            uint32_t th_ms = thObj["threshold_ms"] | HOLD_THRESH_MS;
+            if (dur >= th_ms) fireHold(i);  // Hold 为空则无动作
+            else              fireTap(i);
+          }
+        }
+      }
+    }
+  }
+  // —— 空闲 1 分钟自动进入 Light Sleep（仅 NORMAL 模式）——
+  if (!g_configMode) { // 只在 BLE 正常模式下启用省电
+    uint32_t now2 = millis();
+
+    // 条件：超时且没有按键被按住（避免在长按过程中睡着）
+    if ((now2 - g_lastActivityMs) >= IDLE_SLEEP_TIMEOUT_MS && allKeysReleased()) {
+      enterLightSleepAndWaitKey();
+    }
+  }
+}
