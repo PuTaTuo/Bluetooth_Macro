@@ -50,86 +50,119 @@
 <script src="./esptool-bundle.js"></script>
 
 <!-- ② 再写逻辑：此时全局已有 Transport / ESPLoader -->
-<script>
-  // 固件 RAW 链接
-  const URL_BOOT="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/bootloader.bin";
-  const URL_PART="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/partitions.bin";
-  const URL_APP ="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/firmware.bin";
+<!-- 放在 body 底部；确保整页通过 HTTPS 打开（GitHub Pages 默认是 https） -->
+<script type="module">
+  import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.5.6/lib/index.js";
 
-  const logEl=document.getElementById('log');
-  const statusEl=document.getElementById('status');
-  function logLn(s,cls){const x=document.createElement('div');x.textContent=s;if(cls)x.className=cls;logEl.appendChild(x);logEl.scrollTop=logEl.scrollHeight;}
-  async function fetchAsU8(url){const r=await fetch(url,{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status+" "+url);return new Uint8Array(await r.arrayBuffer());}
-  function hex(v){return "0x"+v.toString(16);}
+  // 简单终端适配：把信息写到页面上的 <pre id="log">
+  const term = {
+    clean() { document.getElementById("log").textContent = ""; },
+    writeLine(d) { document.getElementById("log").textContent += d + "\n"; },
+    write(d) { document.getElementById("log").textContent += d; }
+  };
 
-  let PORT=null, LOADER=null, CONNECTED=false;
+  // 这些 URL 换成你仓库里的三个 bin（已经是 raw 链接则更好）
+  const BIN_BOOT  = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/bootloader.bin";
+  const BIN_PART  = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/partition.bin";
+  const BIN_APP   = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/firmware.bin";
 
-  document.getElementById('connect').addEventListener('click', async ()=>{
-    if(!('serial' in navigator)){ alert('Web Serial not supported. Use Chrome/Edge on desktop.'); return; }
-    try{
-      PORT = await navigator.serial.requestPort({});
-      const baud = parseInt(document.getElementById('baud').value)||115200;
-      await PORT.open({ baudRate: baud });
-      // ★ 直接使用全局类（不要包 ESP.*）
-      const transport = new Transport(PORT);
-      LOADER = new ESPLoader(transport, baud, (t,c)=>logLn(t,c));
-      await LOADER.main({ transport });
-      const chip = await LOADER.chipName();
-      logLn("Connected: "+chip, "ok"); CONNECTED = true;
-    }catch(e){ logLn("Connect error: "+e, "err"); }
-  });
+  // 固定写入地址（ESP32 经典芯片）
+  const ADDR_BOOT = 0x1000;
+  const ADDR_PART = 0x8000;
+  const ADDR_APP  = 0x10000;
 
-  document.getElementById('test').addEventListener('click', async ()=>{
-    try{
-      await fetchAsU8(URL_BOOT); await fetchAsU8(URL_PART); await fetchAsU8(URL_APP);
-      logLn("All files ready.", "ok");
-    }catch(e){ logLn("Download error: "+e, "err"); }
-  });
+  // 简单工具函数：拉取二进制并转成 Uint8Array
+  async function fetchBin(url) {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`Fetch failed: ${url}`);
+    const buf = await res.arrayBuffer();
+    return new Uint8Array(buf);
+  }
 
-  document.getElementById('flash').addEventListener('click', async ()=>{
-    if(!CONNECTED){ alert("Click Connect first."); return; }
-    let boot, part, app;
-    try{
-      [boot,part,app] = await Promise.all([fetchAsU8(URL_BOOT), fetchAsU8(URL_PART), fetchAsU8(URL_APP)]);
-      logLn(`bootloader.bin ${boot.length} bytes`, "ok");
-      logLn(`partitions.bin ${part.length} bytes`, "ok");
-      logLn(`firmware.bin ${app.length} bytes`, "ok");
-    }catch(e){ logLn("Download error: "+e, "err"); return; }
+  // 连接按钮
+  const connectBtn = document.getElementById("btn-connect");
+  // 写入按钮
+  const flashBtn = document.getElementById("btn-flash");
 
-    const mode=document.getElementById('mode').value||'dio';
-    const freq=document.getElementById('freq').value||'40m';
+  let loader;   // ESPLoader 实例（连上后复用）
+  let port;     // SerialPort
 
-    try{
-      if(document.getElementById('erase').checked){
-        logLn("Erasing flash…", "warn");
-        await LOADER.eraseFlash();
-        logLn("Erase done.", "ok");
-      }
+  connectBtn.addEventListener("click", async () => {
+    try {
+      term.clean();
+      term.writeLine("Requesting serial port...");
+      // 选串口（如需过滤 VID/PID，可传 filters）
+      port = await navigator.serial.requestPort({ /* filters: [] */});
+      await port.open({ baudRate: 115200 }); // 初始 115200，后续由 stub 提升
+      term.writeLine("Serial port opened.");
 
-      const parts = [
-        {address:0x1000,  data:boot, name:"bootloader"},
-        {address:0x8000,  data:part, name:"partitions"},
-        {address:0x10000, data:app,  name:"firmware"},
-      ];
-
-      logLn(`Writing ${parts.length} parts… mode=${mode}, freq=${freq}`, "warn");
-      let total = parts.reduce((s,p)=>s+p.data.length,0), written=0;
-      for(let i=0;i<parts.length;i++){
-        const p=parts[i];
-        logLn(`Part ${i+1}/${parts.length}: ${p.name} @ ${hex(p.address)}`);
-        await LOADER.writeFlash([[p.address, p.data]], 'keep', mode, freq, false,
-          (frac,w,tot)=>{ statusEl.textContent = `Flashing… ${((written+w)/total*100).toFixed(1)}%`; }
-        );
-        written += p.data.length;
-        logLn(`  done ${p.data.length} bytes`, "ok");
-      }
-
-      statusEl.textContent = "Resetting…";
-      try{ await LOADER.hardReset(); }catch(e){}
-      logLn("Finished.", "ok");
-    }catch(e){
-      logLn("Flash error: "+e, "err");
-      logLn("Tip: try lower baud (115200), shorter cable, hold BOOT while starting.", "muted");
+      // 创建传输与 Loader（注意：这里是“实例化后的 transport”传给 ESPLoader）
+      const transport = new Transport(port);
+      loader = new ESPLoader({ transport, baudrate: 921600, terminal: term });
+      term.writeLine("Connecting to chip...");
+      await loader.connect();   // 建立与 ROM bootloader 的连接
+      term.writeLine("Connected. Detecting chip...");
+      await loader.detectChip();
+      term.writeLine(`Chip: ${loader.chip.CHIP_NAME || "ESP32"}`);
+      term.writeLine("Ready to flash.");
+    } catch (e) {
+      term.writeLine("Connect error: " + e);
+      try { if (port) await port.close(); } catch(_) {}
+      loader = undefined;
     }
   });
+
+  flashBtn.addEventListener("click", async () => {
+    if (!loader) { term.writeLine("Not connected."); return; }
+    try {
+      term.writeLine("Fetching binaries...");
+      const [boot, part, app] = await Promise.all([
+        fetchBin(BIN_BOOT),
+        fetchBin(BIN_PART),
+        fetchBin(BIN_APP),
+      ]);
+
+      term.writeLine("Entering flashing stub...");
+      await loader.runStub(); // 进入 stub，支持高速传输
+      term.writeLine("Erasing (only necessary regions will be erased)...");
+      // 组合镜像列表（地址升序）
+      const images = [
+        { data: boot, address: ADDR_BOOT },
+        { data: part, address: ADDR_PART },
+        { data: app,  address: ADDR_APP  },
+      ];
+
+      term.writeLine("Writing flash...");
+      // writeFlash 会按顺序写入并自动计算校验
+      await loader.writeFlash({
+        fileArray: images,
+        flashSize: "detect",
+        eraseAll: false,
+        compress: true,
+      });
+
+      term.writeLine("Verifying MD5...");
+      for (const img of images) {
+        const md5 = await loader.flashMd5sum(img.address, img.data.length);
+        term.writeLine(`  0x${img.address.toString(16)}  MD5: ${md5}`);
+      }
+
+      term.writeLine("Flashing done. Resetting to run user code...");
+      await loader.softReset();
+      term.writeLine("✅ Done. You can close this tab now.");
+      try { await port.close(); } catch(_) {}
+    } catch (e) {
+      term.writeLine("Flash error: " + e);
+    }
+  });
+
+  // 环境自检
+  (function checkEnv() {
+    if (!("serial" in navigator)) {
+      document.getElementById("log").textContent =
+        "This browser does not support Web Serial. Please use Chrome/Edge (desktop).";
+    }
+  })();
 </script>
+
+
