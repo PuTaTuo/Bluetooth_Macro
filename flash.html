@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>ESP32 MacroPad — One-Click Web Flasher (Fixed)</title>
+<title>ESP32 MacroPad — One-Click Web Flasher (CDN-fixed)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:24px;color:#222;background:#fafafa}
@@ -16,33 +16,25 @@
   .ok{color:#0a7}.warn{color:#c60}.err{color:#d33}
 </style>
 
-<h1>ESP32 MacroPad — One-Click Web Flasher (Fixed)</h1>
-<p class="muted">Steps: 1) Click <b>Connect</b> → select your ESP32 serial port. 2) Click <b>Flash</b>. If issues, try lower baud (115200), shorter cable, hold <b>BOOT</b> while flashing, or check the “Erase first” checkbox.</p>
+<h1>ESP32 MacroPad — One-Click Web Flasher</h1>
+<p class="muted">
+  Steps: 1) Click <b>Connect</b> → select your ESP32 serial port. 2) Click <b>Flash</b>.<br>
+  If issues, lower baud (115200), shorter cable, press <b>BOOT</b> while flashing.
+</p>
 
 <div class="card">
   <div class="row" style="margin-bottom:12px">
     <button id="connect">Connect</button>
     <label>Baud
       <select id="baud">
-        <option>115200</option>
-        <option>230400</option>
-        <option>460800</option>
-        <option>921600</option>
+        <option>115200</option><option>230400</option><option>460800</option><option>921600</option>
       </select>
     </label>
     <label>Flash mode
-      <select id="mode">
-        <option value="dio">dio</option>
-        <option value="qio">qio</option>
-        <option value="dout">dout</option>
-        <option value="qout">qout</option>
-      </select>
+      <select id="mode"><option value="dio">dio</option><option value="qio">qio</option></select>
     </label>
     <label>Flash freq
-      <select id="freq">
-        <option value="40m">40m</option>
-        <option value="80m">80m</option>
-      </select>
+      <select id="freq"><option value="40m">40m</option><option value="80m">80m</option></select>
     </label>
     <label><input type="checkbox" id="erase"> Erase first</label>
   </div>
@@ -56,135 +48,69 @@
   <div id="log"></div>
 </div>
 
-<!-- Load esptool-js from unpkg -->
-<script src="https://unpkg.com/esptool-js/lib/index.js"></script>
 <script>
-  if (!window.ESPLoader) {
-    // fallback try bundle
-    const s = document.createElement('script');
-    s.src = "https://unpkg.com/esptool-js/bundle.js";
-    document.head.appendChild(s);
+/* 固件 RAW 链接 */
+const URL_BOOT="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/bootloader.bin";
+const URL_PART="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/partitions.bin";
+const URL_APP="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/firmware.bin";
+
+const logEl=document.getElementById('log');const statusEl=document.getElementById('status');
+function logLn(s,cls){const x=document.createElement('div');x.textContent=s;if(cls)x.className=cls;logEl.appendChild(x);logEl.scrollTop=logEl.scrollHeight;}
+async function fetchAsU8(url){const r=await fetch(url,{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status+" "+url);return new Uint8Array(await r.arrayBuffer());}
+function hex(v){return "0x"+v.toString(16);}
+
+let PORT=null,LOADER=null,CONNECTED=false,ESP=null;
+
+/* 动态加载 esptool-js，兼容新旧命名 */
+async function loadEsptool(){
+  if(window.esptool?.ESPLoader) return window.esptool;
+  if(window.ESPLoader&&window.Transport) return {ESPLoader:window.ESPLoader,Transport:window.Transport};
+  const srcs=[
+    "https://unpkg.com/esptool-js@0.5.5/bundle.js",
+    "https://cdn.jsdelivr.net/npm/esptool-js@0.5.5/bundle.js"
+  ];
+  for(const src of srcs){
+    try{
+      await new Promise((ok,err)=>{const s=document.createElement("script");s.src=src;s.onload=ok;s.onerror=()=>err();document.head.appendChild(s);});
+      if(window.esptool?.ESPLoader) return window.esptool;
+      if(window.ESPLoader&&window.Transport) return {ESPLoader:window.ESPLoader,Transport:window.Transport};
+    }catch(e){console.warn("Fail load",src);}
   }
-</script>
-
-<script>
-// Your firmware URLs (raw links)
-const URL_BOOT = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/bootloader.bin";
-const URL_PART = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/partitions.bin";
-const URL_APP  = "https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/firmware.bin";
-
-const logEl = document.getElementById('log');
-const statusEl = document.getElementById('status');
-function logLn(s, cls){ const x=document.createElement('div'); x.textContent=s; if(cls) x.className=cls; logEl.appendChild(x); logEl.scrollTop = logEl.scrollHeight; }
-function hex(v){ return "0x" + v.toString(16); }
-
-async function fetchAsU8(url){
-  const r = await fetch(url, {cache: "no-store"});
-  if (!r.ok) throw new Error(`HTTP ${r.status} loading ${url}`);
-  const buf = await r.arrayBuffer();
-  return new Uint8Array(buf);
+  throw new Error("esptool-js load failed");
 }
 
-let port = null, loader = null, connected = false;
+document.getElementById('connect').addEventListener('click',async()=>{
+  try{ESP=await loadEsptool();}catch(e){alert("Load error "+e.message);return;}
+  if(!("serial"in navigator)){alert("WebSerial unsupported");return;}
+  try{
+    PORT=await navigator.serial.requestPort({});
+    const baud=parseInt(document.getElementById('baud').value)||115200;
+    await PORT.open({baudRate:baud});
+    const transport=new (ESP.Transport||esptool.Transport)(PORT);
+    LOADER=new (ESP.ESPLoader||esptool.ESPLoader)(transport,baud,(t,c)=>logLn(t,c));
+    await LOADER.main({transport});
+    const chip=await LOADER.chipName();
+    logLn("Connected: "+chip,"ok");CONNECTED=true;
+  }catch(e){logLn("Connect error: "+e,"err");}
+});
 
-async function connect(){
-  if (!("serial" in navigator)) {
-    alert("Web Serial API not supported in this browser. Use Chrome / Edge.");
-    return;
-  }
-  logLn("Opening serial…");
-  try {
-    port = await navigator.serial.requestPort({});
-    const baud = parseInt(document.getElementById('baud').value) || 115200;
-    await port.open({ baudRate: baud });
-    const transport = new esptool.Transport(port);
-    loader = new esptool.ESPLoader(transport, baud, logLn);
-    await loader.main({ transport });
-    const chip = await loader.chipName();
-    logLn(`Connected: ${chip}`, "ok");
-    connected = true;
-  } catch (e) {
-    logLn("Connect error: " + e, "err");
-  }
-}
+document.getElementById('test').addEventListener('click',async()=>{
+  try{await fetchAsU8(URL_BOOT);await fetchAsU8(URL_PART);await fetchAsU8(URL_APP);logLn("All files ready.","ok");}
+  catch(e){logLn("Download error "+e,"err");}
+});
 
-async function testDownload(){
-  try {
-    logLn("Downloading bootloader…");
-    const b = await fetchAsU8(URL_BOOT);
-    logLn(`  bootloader.bin ${b.length} bytes`, "ok");
-    logLn("Downloading partitions…");
-    const p = await fetchAsU8(URL_PART);
-    logLn(`  partitions.bin ${p.length} bytes`, "ok");
-    logLn("Downloading firmware…");
-    const a = await fetchAsU8(URL_APP);
-    logLn(`  firmware.bin ${a.length} bytes`, "ok");
-    logLn("All files ready.", "ok");
-  } catch(e) {
-    logLn("Download error: " + e, "err");
-  }
-}
-
-document.getElementById('connect').addEventListener('click', connect);
-document.getElementById('test').addEventListener('click', testDownload);
-
-document.getElementById('flash').addEventListener('click', async ()=>{
-  statusEl.textContent = "";
-  if (!connected) { alert("Click Connect first"); return; }
-
-  let boot, part, app;
-  try {
-    [boot, part, app] = await Promise.all([
-      fetchAsU8(URL_BOOT), fetchAsU8(URL_PART), fetchAsU8(URL_APP)
-    ]);
-    logLn(`bootloader.bin ${boot.length} bytes`, "ok");
-    logLn(`partitions.bin ${part.length} bytes`, "ok");
-    logLn(`firmware.bin ${app.length} bytes`, "ok");
-  } catch(e) {
-    logLn("Download error: " + e, "err");
-    return;
-  }
-
-  const mode = document.getElementById('mode').value || 'dio';
-  const freq = document.getElementById('freq').value || '40m';
-
-  try {
-    if (document.getElementById('erase').checked) {
-      logLn("Erasing flash…", "warn");
-      await loader.eraseFlash();
-      logLn("Erase done.", "ok");
-    }
-
-    const parts = [
-      {address: 0x1000, data: boot, name:"bootloader"},
-      {address: 0x8000, data: part, name:"partitions"},
-      {address: 0x10000, data: app, name:"firmware"}
-    ];
-
-    logLn(`Writing parts… mode=${mode}, freq=${freq}`, "warn");
-    let total = parts.reduce((s,p)=>s + p.data.length, 0);
-    let written = 0;
-    const onProg = (idx, w, tot) => {
-      const sofar = written + w;
-      statusEl.textContent = `Flashing… ${(sofar/total*100).toFixed(1)}%`;
-    };
-
-    for (let i=0; i<parts.length; i++) {
-      const p = parts[i];
-      logLn(`Part ${i+1}/3: ${p.name} @ ${hex(p.address)}`);
-      await loader.writeFlash([[p.address, p.data]], 'keep', mode, freq, false,
-        (frac, w, tot) => onProg(i, w, tot)
-      );
-      written += p.data.length;
-      logLn(`  done ${p.data.length} bytes`, "ok");
-    }
-
-    statusEl.textContent = "Resetting…";
-    try { await loader.hardReset(); } catch(e) {}
-    logLn("Finished.", "ok");
-  } catch(e) {
-    logLn("Flash error: " + e, "err");
-    logLn("Tip: try lower baud (115200), shorter cable, hold BOOT while starting.", "muted");
-  }
+document.getElementById('flash').addEventListener('click',async()=>{
+  if(!CONNECTED){alert("Connect first");return;}
+  let boot,part,app;try{[boot,part,app]=await Promise.all([fetchAsU8(URL_BOOT),fetchAsU8(URL_PART),fetchAsU8(URL_APP)]);}
+  catch(e){logLn("Download err "+e,"err");return;}
+  const mode=document.getElementById('mode').value||'dio';const freq=document.getElementById('freq').value||'40m';
+  try{
+    if(document.getElementById('erase').checked){logLn("Erasing…","warn");await LOADER.eraseFlash();logLn("Erase done","ok");}
+    const parts=[{address:0x1000,data:boot,name:"bootloader"},{address:0x8000,data:part,name:"partitions"},{address:0x10000,data:app,name:"firmware"}];
+    let total=parts.reduce((s,p)=>s+p.data.length,0),written=0;
+    for(let i=0;i<parts.length;i++){const p=parts[i];logLn(`Part ${i+1}: ${p.name} @ ${hex(p.address)}`);await LOADER.writeFlash([[p.address,p.data]],'keep',mode,freq,false,(f,w)=>{statusEl.textContent=`Flashing… ${((written+w)/total*100).toFixed(1)}%`;});written+=p.data.length;logLn("done "+p.data.length,"ok");}
+    statusEl.textContent="Resetting…";try{await LOADER.hardReset();}catch(e){}
+    logLn("Finished.","ok");
+  }catch(e){logLn("Flash err "+e,"err");}
 });
 </script>
