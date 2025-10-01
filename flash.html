@@ -29,7 +29,7 @@
       </select>
     </label>
     <label>Flash mode
-      <select id="mode"><option value="dio">dio</option><option value="qio">qio</option></select>
+      <select id="mode"><option value="dio">dio</option><option value="qio">qio</option><option value="dout">dout</option><option value="qout">qout</option></select>
     </label>
     <label>Flash freq
       <select id="freq"><option value="40m">40m</option><option value="80m">80m</option></select>
@@ -49,9 +49,9 @@
 <!-- ① 先加载本地 bundle：务必与本文件同目录 -->
 <script src="./esptool-bundle.js"></script>
 
-<!-- ② 再写你的逻辑：此时 window.ESPLoader / window.Transport 已存在 -->
+<!-- ② 再写逻辑：此时全局已有 Transport / ESPLoader -->
 <script>
-  // 固件 RAW 链接（保持与你仓库一致）
+  // 固件 RAW 链接
   const URL_BOOT="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/bootloader.bin";
   const URL_PART="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/partitions.bin";
   const URL_APP ="https://raw.githubusercontent.com/PuTaTuo/Bluetooth_Macro/main/firmware.bin";
@@ -70,8 +70,9 @@
       PORT = await navigator.serial.requestPort({});
       const baud = parseInt(document.getElementById('baud').value)||115200;
       await PORT.open({ baudRate: baud });
-      const transport = new window.Transport(PORT);
-      LOADER = new window.ESPLoader(transport, baud, (t,c)=>logLn(t,c));
+      // ★ 直接使用全局类（不要包 ESP.*）
+      const transport = new Transport(PORT);
+      LOADER = new ESPLoader(transport, baud, (t,c)=>logLn(t,c));
       await LOADER.main({ transport });
       const chip = await LOADER.chipName();
       logLn("Connected: "+chip, "ok"); CONNECTED = true;
